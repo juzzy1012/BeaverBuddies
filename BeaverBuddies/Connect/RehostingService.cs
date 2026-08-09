@@ -94,14 +94,19 @@ namespace BeaverBuddies.Connect
             return true;
         }
 
-        public bool RehostGame()
+        public bool RehostGame(Action beforeReload = null, int minimumReadyClients = 0)
         {
-            return SaveRehostFile(LoadGame, true);
+            return SaveRehostFile(saveReference =>
+            {
+                beforeReload?.Invoke();
+                LoadGame(saveReference, minimumReadyClients);
+            }, true);
         }
 
-        public void LoadGame(SaveReference saveReference)
+        public void LoadGame(SaveReference saveReference, int minimumReadyClients = 0)
         {
-            ServerHostingUtils.LoadIfSaveValidAndHost(_validatingGameLoader, _dialogBoxShower, saveReference);
+            ServerHostingUtils.LoadIfSaveValidAndHost(
+                _validatingGameLoader, _dialogBoxShower, saveReference, minimumReadyClients);
         }
     }
 }

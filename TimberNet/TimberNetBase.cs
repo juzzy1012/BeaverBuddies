@@ -22,6 +22,10 @@ namespace TimberNet
         public const string TYPE_KEY = "type";
         public const string SET_STATE_EVENT = "SetState";
         public const string HEARTBEAT_EVENT = "Heartbeat";
+        public const string CLIENT_READY_EVENT = "ClientReady";
+        public const string SESSION_RESTART_EVENT = "SessionRestart";
+        public const string SESSION_RESTART_REQUIRED = "BeaverBuddies.SessionRestartRequired";
+        public const string READY_TOKEN_KEY = "readyToken";
         public const int MAX_BUFFER_SIZE = 8192 * 4; // 32K
 
         public delegate void MessageReceived(string message);

@@ -17,6 +17,11 @@ namespace TimberNet
     {
 
         private readonly ISocketStream client;
+        private string? readyToken;
+        private bool hasFinishedLoading;
+        private bool readyNotificationSent;
+
+        public event Action? OnSessionRestart;
 
         public override bool ShouldTick => base.ShouldTick && receivedEvents.Count > 0;
 
@@ -30,6 +35,47 @@ namespace TimberNet
             // Don't actually do the event (i.e. add it to the hash)
             // Wait for the server to confirm w/ adjusted Tick
             SendEvent(client, message);
+        }
+
+        protected override void ReceiveEvent(JObject message)
+        {
+            string type = GetType(message);
+            if (type == SET_STATE_EVENT)
+            {
+                readyToken = message[READY_TOKEN_KEY]?.ToObject<string>();
+                TryNotifyLoaded();
+            }
+            else if (type == SESSION_RESTART_EVENT)
+            {
+                Log("Host requested a coordinated session reload");
+                OnSessionRestart?.Invoke();
+                return;
+            }
+            base.ReceiveEvent(message);
+        }
+
+        public void NotifyLoaded()
+        {
+            hasFinishedLoading = true;
+            // Process any state message that arrived while the game scene loaded.
+            Update();
+            TryNotifyLoaded();
+        }
+
+        private void TryNotifyLoaded()
+        {
+            if (!hasFinishedLoading || readyNotificationSent || string.IsNullOrEmpty(readyToken))
+            {
+                return;
+            }
+
+            JObject message = new JObject();
+            message[TICKS_KEY] = TickCount;
+            message[TYPE_KEY] = CLIENT_READY_EVENT;
+            message[READY_TOKEN_KEY] = readyToken;
+            SendEvent(client, message);
+            readyNotificationSent = true;
+            Log("Notified server that loading finished");
         }
 
         protected override void ProcessReceivedEvent(JObject message)

@@ -15,11 +15,27 @@ using Timberborn.WebNavigation;
 using TimberNet;
 using System.Linq;
 using Timberborn.SettlementNameSystem;
+using System.Collections.Concurrent;
 
 namespace BeaverBuddies.Connect
 {
     public class ClientConnectionService : IUpdatableSingleton
     {
+        private const int ReconnectRetryDelayFrames = 30;
+        private static readonly TimeSpan ReconnectTimeout = TimeSpan.FromMinutes(2);
+        private static readonly object ReconnectLock = new object();
+        private static readonly ConcurrentQueue<Tuple<string, string>> PendingErrors =
+            new ConcurrentQueue<Tuple<string, string>>();
+
+        // These are static because Timberborn replaces scene singletons while a
+        // save is loading. The reconnect target must survive that replacement.
+        private static Func<ISocketStream> reconnectSocketFactory;
+        private static bool reconnectActive;
+        private static bool reconnectAttemptInProgress;
+        private static bool reconnectDisconnectCurrent;
+        private static DateTime reconnectDeadlineUtc;
+        private static int reconnectDelayFrames;
+
         private GameSceneLoader _gameSceneLoader;
         private GameSaveRepository _gameSaveRepository;
         private DialogBoxShower _dialogBoxShower;
@@ -44,7 +60,9 @@ namespace BeaverBuddies.Connect
 
         public bool TryToConnect(CSteamID friendID)
         {
-            return TryToConnect(new SteamSocket(friendID));
+            Func<ISocketStream> socketFactory = () => new SteamSocket(friendID);
+            PrepareManualConnection(socketFactory);
+            return TryToConnect(socketFactory(), false);
         }
 
         public bool TryToConnect(string address)
@@ -86,16 +104,71 @@ namespace BeaverBuddies.Connect
                 }
             }
 
-            return TryToConnect(new TCPClientWrapper(address, port));
+            string finalAddress = address;
+            int finalPort = port;
+            Func<ISocketStream> socketFactory = () => new TCPClientWrapper(finalAddress, finalPort);
+            PrepareManualConnection(socketFactory);
+            return TryToConnect(socketFactory(), false);
         }
 
-        private bool TryToConnect(ISocketStream socket)
+        private static void PrepareManualConnection(Func<ISocketStream> socketFactory)
+        {
+            lock (ReconnectLock)
+            {
+                reconnectSocketFactory = socketFactory;
+                reconnectActive = false;
+                reconnectAttemptInProgress = false;
+                reconnectDisconnectCurrent = false;
+            }
+        }
+
+        private static void RequestSessionReconnect()
+        {
+            lock (ReconnectLock)
+            {
+                if (reconnectSocketFactory == null)
+                {
+                    Plugin.LogError("A session reload was requested without a reconnect target");
+                    return;
+                }
+
+                if (!reconnectActive)
+                {
+                    reconnectDeadlineUtc = DateTime.UtcNow + ReconnectTimeout;
+                    Plugin.Log("Session is reloading; reconnecting automatically");
+                }
+                reconnectActive = true;
+                reconnectDisconnectCurrent = true;
+                reconnectDelayFrames = ReconnectRetryDelayFrames;
+            }
+        }
+
+        private static void FinishSessionReconnect()
+        {
+            lock (ReconnectLock)
+            {
+                reconnectActive = false;
+                reconnectAttemptInProgress = false;
+                reconnectDisconnectCurrent = false;
+            }
+        }
+
+        private bool TryToConnect(ISocketStream socket, bool automatic)
         {
             Plugin.Log("Connecting client");
             client = ClientEventIO.Create(socket, LoadMap, (error) =>
             {
-                ShowError("BeaverBuddies.JoinCoopGame.Error.CouldNotConnect", error);
-            });
+                client = null;
+                if (automatic || error == TimberNetBase.SESSION_RESTART_REQUIRED)
+                {
+                    RequestSessionReconnect();
+                }
+                else
+                {
+                    PendingErrors.Enqueue(Tuple.Create(
+                        "BeaverBuddies.JoinCoopGame.Error.CouldNotConnect", error));
+                }
+            }, RequestSessionReconnect);
             
             if (client == null)
             {
@@ -176,8 +249,31 @@ namespace BeaverBuddies.Connect
                 .Show();
         }
 
+        private static bool IsValidMap(byte[] mapBytes)
+        {
+            // Timberborn saves are ZIP archives. Reject connection/control data
+            // before handing it to the asynchronous game loader, where a bad
+            // archive would otherwise crash with an EOCD exception.
+            return mapBytes != null && mapBytes.Length >= 4 &&
+                mapBytes[0] == 0x50 && mapBytes[1] == 0x4B &&
+                mapBytes[2] == 0x03 && mapBytes[3] == 0x04;
+        }
+
         private void LoadMap(byte[] mapBytes)
         {
+            if (!IsValidMap(mapBytes))
+            {
+                Plugin.LogError($"Received invalid map data ({mapBytes?.Length ?? 0} bytes); " +
+                    "the host likely disconnected. Aborting load instead of crashing.");
+                ShowError(null);
+                FinishSessionReconnect();
+                EventIO.Reset();
+                client = null;
+                return;
+            }
+
+            FinishSessionReconnect();
+
             // Clean up our current co-op state before loading,
             // so we don't, for example, end up ticking the client before
             // it's actually loaded.
@@ -199,9 +295,88 @@ namespace BeaverBuddies.Connect
 
         public void UpdateSingleton()
         {
-            if (client == null) return;
-            //Plugin.Log("Updating client!");
-            client.Update();
+            while (PendingErrors.TryDequeue(out Tuple<string, string> error))
+            {
+                ShowError(error.Item1, error.Item2);
+            }
+
+            // This instance owns a connection while joining from the menu. Once
+            // the game scene loads, ReplayService updates the shared EventIO.
+            client?.Update();
+
+            Func<ISocketStream> socketFactory = null;
+            bool disconnectCurrent = false;
+            bool timedOut = false;
+            lock (ReconnectLock)
+            {
+                if (!reconnectActive || reconnectAttemptInProgress)
+                {
+                    return;
+                }
+
+                if (DateTime.UtcNow >= reconnectDeadlineUtc)
+                {
+                    reconnectActive = false;
+                    reconnectDisconnectCurrent = false;
+                    timedOut = true;
+                }
+                else
+                {
+                    disconnectCurrent = reconnectDisconnectCurrent;
+                    reconnectDisconnectCurrent = false;
+
+                    if (reconnectDelayFrames > 0)
+                    {
+                        reconnectDelayFrames--;
+                    }
+                    else if (client == null)
+                    {
+                        socketFactory = reconnectSocketFactory;
+                        reconnectAttemptInProgress = true;
+                    }
+                }
+            }
+
+            if (disconnectCurrent)
+            {
+                EventIO.Reset();
+                client = null;
+            }
+
+            if (timedOut)
+            {
+                EventIO.Reset();
+                client = null;
+                ShowError("BeaverBuddies.JoinCoopGame.Error.CouldNotConnect",
+                    "The host did not finish reloading within two minutes.");
+                return;
+            }
+
+            if (socketFactory == null)
+            {
+                return;
+            }
+
+            bool connected = false;
+            try
+            {
+                connected = TryToConnect(socketFactory(), true);
+            }
+            catch (Exception exception)
+            {
+                Plugin.LogError($"Automatic reconnect failed: {exception}");
+            }
+            finally
+            {
+                lock (ReconnectLock)
+                {
+                    reconnectAttemptInProgress = false;
+                    if (!connected && reconnectActive)
+                    {
+                        reconnectDelayFrames = ReconnectRetryDelayFrames;
+                    }
+                }
+            }
         }
 
         /// <summary>

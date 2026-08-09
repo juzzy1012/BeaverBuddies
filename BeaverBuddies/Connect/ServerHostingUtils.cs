@@ -70,9 +70,10 @@ namespace BeaverBuddies.Connect
 
     internal class ServerHostingUtils
     {
-        public static void LoadIfSaveValidAndHost(ValidatingGameLoader loader, DialogBoxShower shower, SaveReference saveReferece)
+        public static void LoadIfSaveValidAndHost(ValidatingGameLoader loader, DialogBoxShower shower,
+            SaveReference saveReferece, int minimumReadyClients = 0)
         {
-            CheckNextValidator(loader, shower, saveReferece, 0);
+            CheckNextValidator(loader, shower, saveReferece, 0, minimumReadyClients);
         }
 
         [ManualMethodOverwrite]
@@ -88,16 +89,17 @@ namespace BeaverBuddies.Connect
 	        CheckNextValidator(saveReference, index + 1);
         });
          */
-        private static void CheckNextValidator(ValidatingGameLoader loader, DialogBoxShower shower, SaveReference saveReference, int index)
+        private static void CheckNextValidator(ValidatingGameLoader loader, DialogBoxShower shower,
+            SaveReference saveReference, int index, int minimumReadyClients)
         {
             if (index >= loader._gameLoadValidators.Length)
             {
-                LoadAndHost(loader, shower, saveReference);
+                LoadAndHost(loader, shower, saveReference, minimumReadyClients);
                 return;
             }
             loader._gameLoadValidators[index].ValidateSave(saveReference, delegate
             {
-                CheckNextValidator(loader, shower, saveReference, index + 1);
+                CheckNextValidator(loader, shower, saveReference, index + 1, minimumReadyClients);
             });
         }
 
@@ -138,7 +140,8 @@ namespace BeaverBuddies.Connect
             return ((SceneLoader)loader)._coroutineStarter._monoBehaviour;
         }
 
-        public static void LoadAndHost(ValidatingGameLoader loader, DialogBoxShower shower, SaveReference saveReference)
+        public static void LoadAndHost(ValidatingGameLoader loader, DialogBoxShower shower,
+            SaveReference saveReference, int minimumReadyClients = 0)
         {
             var sceneLoader = loader._gameSceneLoader;
             var repository = sceneLoader._gameSaveRepository;
@@ -147,7 +150,7 @@ namespace BeaverBuddies.Connect
 
             ServerEventIO io = new ServerEventIO();
             EventIO.Set(io);
-            io.Start(data);
+            io.Start(data, minimumReadyClients);
 
             var behavior = GetMonoBehaviour(sceneLoader._sceneLoader);
             Coroutine coroutine = null;

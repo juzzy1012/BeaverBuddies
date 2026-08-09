@@ -20,17 +20,25 @@ namespace BeaverBuddies.IO
         public override UserEventBehavior UserEventBehavior => UserEventBehavior.Send;
 
         private MapReceived mapReceivedCallback;
+        private Action sessionRestartCallback;
         private bool FailedToConnect = false;
 
+        public void NotifyLoaded()
+        {
+            NetBase?.NotifyLoaded();
+        }
+
         private ClientEventIO(ISocketStream socket, MapReceived mapReceivedCallback,
-            Action<string> onError)
+            Action<string> onError, Action onSessionRestart)
         {
             this.mapReceivedCallback = mapReceivedCallback;
+            sessionRestartCallback = onSessionRestart;
 
             TryRegisterSteamPacketReceiver(socket);
 
             NetBase = new TimberClient(socket);
             NetBase.OnMapReceived += mapReceivedCallback;
+            NetBase.OnSessionRestart += sessionRestartCallback;
             NetBase.OnLog += Plugin.Log;
             NetBase.OnError += (error) =>
             {
@@ -56,13 +64,16 @@ namespace BeaverBuddies.IO
         {
             if (NetBase == null) return;
             NetBase.OnMapReceived -= mapReceivedCallback;
+            NetBase.OnSessionRestart -= sessionRestartCallback;
             NetBase.OnLog -= Plugin.Log;
+            NetBase.Close();
             NetBase = null;
         }
 
-        public static ClientEventIO Create(ISocketStream socket, MapReceived mapReceivedCallback, Action<string> onError)
+        public static ClientEventIO Create(ISocketStream socket, MapReceived mapReceivedCallback,
+            Action<string> onError, Action onSessionRestart)
         {
-            ClientEventIO eventIO = new ClientEventIO(socket, mapReceivedCallback, onError);
+            ClientEventIO eventIO = new ClientEventIO(socket, mapReceivedCallback, onError, onSessionRestart);
             if (eventIO.FailedToConnect) return null;
             return eventIO;
         }

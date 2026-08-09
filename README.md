@@ -9,6 +9,13 @@
 
 BeaverBuddies is a mod to allow multiplayer co-op in Timberborn.
 
+## Fork Attribution
+
+This repository is a fork of the original
+[BeaverBuddies project](https://github.com/thomaswp/BeaverBuddies), created by
+[@thomaswp](https://github.com/thomaswp). The upstream Git history, copyright
+notices, and GNU GPL v3 license are preserved.
+
 > [!IMPORTANT]
 > **If you would like to use the BeaverBuddies mod**, please see [the setup instructions in the wiki](https://github.com/thomaswp/BeaverBuddies/wiki)! This README is for developers.
 

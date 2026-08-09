@@ -4,8 +4,7 @@ using BeaverBuddies.Util;
 using Steamworks;
 using System;
 using System.IO;
-using System.Net.Sockets;
-using System.Net;
+using System.IO.Compression;
 using Timberborn.CoreUI;
 using Timberborn.GameSaveRepositorySystem;
 using Timberborn.GameSceneLoading;
@@ -15,11 +14,39 @@ using Timberborn.WebNavigation;
 using TimberNet;
 using System.Linq;
 using Timberborn.SettlementNameSystem;
+using System.Collections.Concurrent;
+using System.Diagnostics;
 
 namespace BeaverBuddies.Connect
 {
     public class ClientConnectionService : IUpdatableSingleton
     {
+        private const int InitialReconnectDelayMilliseconds = 250;
+        private const int MaximumReconnectDelayMilliseconds = 2000;
+        private static readonly TimeSpan ReconnectTimeout = TimeSpan.FromMinutes(2);
+        private static readonly object ReconnectLock = new object();
+        private static readonly ConcurrentQueue<PendingConnectionError> PendingErrors =
+            new ConcurrentQueue<PendingConnectionError>();
+
+        // These are static because Timberborn replaces scene singletons while a
+        // save is loading. The reconnect target must survive that replacement.
+        private static Func<ISocketStream> reconnectSocketFactory;
+        private static bool reconnectActive;
+        private static bool reconnectAttemptInProgress;
+        private static bool reconnectDisconnectCurrent;
+        private static long reconnectDeadlineTimestamp;
+        private static long reconnectNextAttemptTimestamp;
+        private static int reconnectAttempts;
+        private static long nextConnectionGeneration;
+        private static long activeConnectionGeneration;
+
+        private sealed class PendingConnectionError
+        {
+            public long Generation;
+            public string ReasonKey;
+            public string Details;
+        }
+
         private GameSceneLoader _gameSceneLoader;
         private GameSaveRepository _gameSaveRepository;
         private DialogBoxShower _dialogBoxShower;
@@ -44,18 +71,19 @@ namespace BeaverBuddies.Connect
 
         public bool TryToConnect(CSteamID friendID)
         {
-            return TryToConnect(new SteamSocket(friendID));
+            Func<ISocketStream> socketFactory = () => new SteamSocket(friendID);
+            PrepareManualConnection(socketFactory);
+            return TryToConnect(socketFactory(), false);
         }
 
         public bool TryToConnect(string address)
         {
             int port = _settings.DefaultPort.Value;
-            Plugin.Log("Try to resolve address: " + address);
+            Plugin.Log("Connecting to address: " + address);
             // Parse address and port
             if (TryParseHostAndPort(address, out string parsedAddress, out int? parsedPort))
             {
                 address = parsedAddress;
-                Plugin.Log($"Parsed address: {address}, port: {port}");
             }
             else
             {
@@ -68,34 +96,149 @@ namespace BeaverBuddies.Connect
             {
                 port = parsedPort.Value;
             }
+            Plugin.Log($"Parsed address: {address}, port: {port}");
 
 
-            // If it's not an IP address, resolve the hostname
-            if (!IPAddress.TryParse(address, out _))
+            string finalAddress = address;
+            int finalPort = port;
+            Func<ISocketStream> socketFactory = () => new TCPClientWrapper(finalAddress, finalPort);
+            PrepareManualConnection(socketFactory);
+            return TryToConnect(socketFactory(), false);
+        }
+
+        private static void PrepareManualConnection(Func<ISocketStream> socketFactory)
+        {
+            lock (ReconnectLock)
             {
+                activeConnectionGeneration = ++nextConnectionGeneration;
+                reconnectSocketFactory = socketFactory;
+                reconnectActive = false;
+                reconnectAttemptInProgress = false;
+                reconnectDisconnectCurrent = false;
+                reconnectAttempts = 0;
+            }
+        }
 
-                // Resolve the address if it's a hostname
-                if (ResolveHostnameIfNecessary(parsedAddress, out string resolvedAddress))
+        private static long TimestampAfter(TimeSpan delay)
+        {
+            return Stopwatch.GetTimestamp() +
+                (long)(delay.TotalSeconds * Stopwatch.Frequency);
+        }
+
+        private static void ScheduleReconnectLocked(bool failedAttempt)
+        {
+            if (failedAttempt)
+            {
+                reconnectAttempts = Math.Min(reconnectAttempts + 1, 16);
+            }
+
+            int exponent = Math.Min(reconnectAttempts, 3);
+            int delayMilliseconds = Math.Min(
+                MaximumReconnectDelayMilliseconds,
+                InitialReconnectDelayMilliseconds * (1 << exponent));
+            reconnectNextAttemptTimestamp = TimestampAfter(
+                TimeSpan.FromMilliseconds(delayMilliseconds));
+        }
+
+        private static void RequestSessionReconnect(long generation, bool failedAttempt)
+        {
+            lock (ReconnectLock)
+            {
+                if (generation != activeConnectionGeneration)
                 {
-                    address = resolvedAddress;
+                    return;
+                }
+                if (reconnectSocketFactory == null)
+                {
+                    Plugin.LogError("A session reload was requested without a reconnect target");
+                    return;
+                }
+
+                if (!reconnectActive)
+                {
+                    reconnectDeadlineTimestamp = TimestampAfter(ReconnectTimeout);
+                    reconnectAttempts = 0;
+                    Plugin.Log("Session is reloading; reconnecting automatically");
+                }
+                reconnectActive = true;
+                reconnectDisconnectCurrent = true;
+                ScheduleReconnectLocked(failedAttempt);
+            }
+        }
+
+        private static bool FinishSessionReconnect(long generation)
+        {
+            lock (ReconnectLock)
+            {
+                if (generation != activeConnectionGeneration)
+                {
+                    return false;
+                }
+                reconnectActive = false;
+                reconnectAttemptInProgress = false;
+                reconnectDisconnectCurrent = false;
+                reconnectAttempts = 0;
+                return true;
+            }
+        }
+
+        private static void ExtendReconnectForMap(long generation, int mapLength)
+        {
+            // Steam's legacy reliable transport is deliberately throttled. Once a
+            // valid map header arrives, base the deadline on the announced size so
+            // a healthy large transfer is not mistaken for a failed reconnect.
+            const double conservativeBytesPerSecond = 128 * 1024;
+            double expectedSeconds = mapLength / conservativeBytesPerSecond;
+            TimeSpan transferBudget = TimeSpan.FromSeconds(
+                Math.Max(TimeSpan.FromMinutes(5).TotalSeconds,
+                    expectedSeconds * 2 + 30));
+
+            lock (ReconnectLock)
+            {
+                if (!reconnectActive || generation != activeConnectionGeneration)
+                {
+                    return;
+                }
+
+                long extendedDeadline = TimestampAfter(transferBudget);
+                if (extendedDeadline > reconnectDeadlineTimestamp)
+                {
+                    reconnectDeadlineTimestamp = extendedDeadline;
+                }
+            }
+        }
+
+        private bool TryToConnect(ISocketStream socket, bool automatic)
+        {
+            Plugin.Log("Connecting client");
+            long generation;
+            lock (ReconnectLock)
+            {
+                generation = ++nextConnectionGeneration;
+                activeConnectionGeneration = generation;
+            }
+
+            ClientEventIO newClient = ClientEventIO.Create(socket,
+                mapBytes => LoadMap(mapBytes, generation), error =>
+            {
+                if (automatic || error == TimberNetBase.SESSION_RESTART_REQUIRED)
+                {
+                    RequestSessionReconnect(generation, automatic);
                 }
                 else
                 {
-                    ShowError("BeaverBuddies.JoinCoopGame.Error.InvalidAddress");
-                    return false;
+                    PendingErrors.Enqueue(new PendingConnectionError
+                    {
+                        Generation = generation,
+                        ReasonKey = "BeaverBuddies.JoinCoopGame.Error.CouldNotConnect",
+                        Details = error,
+                    });
                 }
-            }
+            }, () => RequestSessionReconnect(generation, false),
+                reason => RequestSessionReconnect(generation, true),
+                mapLength => ExtendReconnectForMap(generation, mapLength));
 
-            return TryToConnect(new TCPClientWrapper(address, port));
-        }
-
-        private bool TryToConnect(ISocketStream socket)
-        {
-            Plugin.Log("Connecting client");
-            client = ClientEventIO.Create(socket, LoadMap, (error) =>
-            {
-                ShowError("BeaverBuddies.JoinCoopGame.Error.CouldNotConnect", error);
-            });
+            client = newClient;
             
             if (client == null)
             {
@@ -176,32 +319,173 @@ namespace BeaverBuddies.Connect
                 .Show();
         }
 
-        private void LoadMap(byte[] mapBytes)
+        private static bool IsValidMap(byte[] mapBytes)
         {
+            // Timberborn saves are ZIP archives. Reject connection/control data
+            // before handing it to the asynchronous game loader, where a bad
+            // archive would otherwise crash with an EOCD exception.
+            if (mapBytes == null || mapBytes.Length < 4 ||
+                mapBytes[0] != 0x50 || mapBytes[1] != 0x4B ||
+                mapBytes[2] != 0x03 || mapBytes[3] != 0x04)
+            {
+                return false;
+            }
+
+            try
+            {
+                using (var stream = new MemoryStream(mapBytes, writable: false))
+                using (var archive = new ZipArchive(stream, ZipArchiveMode.Read))
+                {
+                    // Opening the archive validates its central directory, which
+                    // catches truncated payloads that still have the PK prefix.
+                    return archive.Entries.Count > 0;
+                }
+            }
+            catch (InvalidDataException)
+            {
+                return false;
+            }
+        }
+
+        private void LoadMap(byte[] mapBytes, long generation)
+        {
+            if (!FinishSessionReconnect(generation))
+            {
+                Plugin.Log("Ignoring a map from a superseded connection attempt");
+                return;
+            }
+
+            if (!IsValidMap(mapBytes))
+            {
+                Plugin.LogError($"Received invalid map data ({mapBytes?.Length ?? 0} bytes); " +
+                    "the host likely disconnected. Aborting load instead of crashing.");
+                ShowError(null);
+                EventIO.Reset();
+                client = null;
+                return;
+            }
+
             // Clean up our current co-op state before loading,
             // so we don't, for example, end up ticking the client before
             // it's actually loaded.
             SingletonManager.Reset();
 
-            Plugin.Log("Loading map");
-            //string saveName = Guid.NewGuid().ToString();
-            string saveName = TimberNetBase.GetHashCode(mapBytes).ToString("X8");
-            SaveReference saveRef = new SaveReference("Online Games", new SettlementReference(saveName, _gameSaveRepository.DefaultSaveDirectory));
-            Stream stream = _gameSaveRepository.CreateSaveSkippingNameValidation(saveRef);
-            stream.Write(mapBytes);
-            stream.Close();
+            try
+            {
+                Plugin.Log("Loading map");
+                string saveName = TimberNetBase.GetHashCode(mapBytes).ToString("X8");
+                SaveReference saveRef = new SaveReference("Online Games",
+                    new SettlementReference(saveName, _gameSaveRepository.DefaultSaveDirectory));
+                using (Stream stream = _gameSaveRepository.CreateSaveSkippingNameValidation(saveRef))
+                {
+                    stream.Write(mapBytes);
+                }
 
-            // Set the RNG seed before loading the map
-            // The server does the same
-            DeterminismService.InitGameStartState(mapBytes);
-            _gameSceneLoader.StartSaveGame(saveRef);
+                // Set the RNG seed before loading the map. The server does the same.
+                DeterminismService.InitGameStartState(mapBytes);
+                _gameSceneLoader.StartSaveGame(saveRef);
+            }
+            catch (Exception exception)
+            {
+                Plugin.LogError($"Could not store or load the multiplayer save: {exception}");
+                ShowError(null);
+                EventIO.Reset();
+                client = null;
+            }
         }
 
         public void UpdateSingleton()
         {
-            if (client == null) return;
-            //Plugin.Log("Updating client!");
-            client.Update();
+            while (PendingErrors.TryDequeue(out PendingConnectionError error))
+            {
+                bool isCurrent;
+                lock (ReconnectLock)
+                {
+                    isCurrent = error.Generation == activeConnectionGeneration;
+                }
+                if (!isCurrent)
+                {
+                    continue;
+                }
+                EventIO.Reset();
+                client = null;
+                ShowError(error.ReasonKey, error.Details);
+            }
+
+            // This instance owns a connection while joining from the menu. Once
+            // the game scene loads, ReplayService updates the shared EventIO.
+            client?.Update();
+
+            Func<ISocketStream> socketFactory = null;
+            bool disconnectCurrent = false;
+            bool timedOut = false;
+            lock (ReconnectLock)
+            {
+                if (!reconnectActive || reconnectAttemptInProgress)
+                {
+                    return;
+                }
+
+                long now = Stopwatch.GetTimestamp();
+                if (now >= reconnectDeadlineTimestamp)
+                {
+                    reconnectActive = false;
+                    reconnectDisconnectCurrent = false;
+                    timedOut = true;
+                }
+                else
+                {
+                    disconnectCurrent = reconnectDisconnectCurrent;
+                    reconnectDisconnectCurrent = false;
+
+                    if (now >= reconnectNextAttemptTimestamp && client == null)
+                    {
+                        socketFactory = reconnectSocketFactory;
+                        reconnectAttemptInProgress = true;
+                    }
+                }
+            }
+
+            if (disconnectCurrent)
+            {
+                EventIO.Reset();
+                client = null;
+            }
+
+            if (timedOut)
+            {
+                EventIO.Reset();
+                client = null;
+                ShowError("BeaverBuddies.JoinCoopGame.Error.CouldNotConnect",
+                    "The host did not finish reloading before the connection deadline.");
+                return;
+            }
+
+            if (socketFactory == null)
+            {
+                return;
+            }
+
+            bool connected = false;
+            try
+            {
+                connected = TryToConnect(socketFactory(), true);
+            }
+            catch (Exception exception)
+            {
+                Plugin.LogError($"Automatic reconnect failed: {exception}");
+            }
+            finally
+            {
+                lock (ReconnectLock)
+                {
+                    reconnectAttemptInProgress = false;
+                    if (!connected && reconnectActive)
+                    {
+                        ScheduleReconnectLocked(true);
+                    }
+                }
+            }
         }
 
         /// <summary>
@@ -243,27 +527,5 @@ namespace BeaverBuddies.Connect
             return true;
         }
 
-        private bool ResolveHostnameIfNecessary(string address, out string resolvedAddress)
-        {
-            resolvedAddress = null;
-
-            try
-            {
-                // Otherwise, try to resolve it
-                IPHostEntry hostEntry = Dns.GetHostEntry(address);
-                if (hostEntry.AddressList.Length > 0)
-                {
-                    resolvedAddress = hostEntry.AddressList[0].ToString();
-                    Plugin.Log(address + " resolved to " + resolvedAddress);
-                    return true;
-                }
-            }
-            catch (Exception ex)
-            {
-                Plugin.LogError("Could not resolve hostname: " + ex.ToString());
-            }
-
-            return false;
-        }
     }
 }

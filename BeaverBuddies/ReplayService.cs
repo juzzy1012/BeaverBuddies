@@ -84,6 +84,7 @@ namespace BeaverBuddies
         private readonly ISingletonRepository _singletonRepository;
         private readonly TickingService _tickingService;
         private readonly DeterminismService _determinismService;
+        private readonly RehostingService _rehostingService;
 
         private readonly GameSaveHelper gameSaveHelper;
 
@@ -123,12 +124,25 @@ namespace BeaverBuddies
             {
                 // The client shouldn't tick until the server has sent a heartbeat
                 // Check the *next* tick, since current tick has already happened
-                return !(io is ClientEventIO && !io.HasEventsForTick(TicksSinceLoad + 1));
+                if (io is ClientEventIO && !io.HasEventsForTick(TicksSinceLoad + 1))
+                {
+                    return false;
+                }
+
+                // The server must not send its first heartbeat or start simulation
+                // until every connected client has finished loading the same save.
+                if (io is ServerEventIO server && !server.AreAllClientsReady)
+                {
+                    return false;
+                }
+
+                return true;
             }
         }
 
         public static bool IsLoaded { get; private set; } = false;
         private bool isReset = false;
+        private bool coordinatedRehostStarted = false;
 
         private bool CanAct => io != null && !isReset && !IsDesynced;
 
@@ -142,6 +156,7 @@ namespace BeaverBuddies
             IsLoaded = false;
             IsReplayingEvents = false;
             isReset = true;
+            coordinatedRehostStarted = false;
         }
 
         public ReplayService(
@@ -201,7 +216,7 @@ namespace BeaverBuddies
             AddSingleton(optionsBox);
             AddSingleton(dialogBoxShower);
             AddSingleton(urlOpener);
-            AddSingleton(rehostingService);
+            _rehostingService = AddSingleton(rehostingService);
             AddSingleton(reportingService);
             AddSingleton(gameSaveRepository);
             AddSingleton(mapNameService);
@@ -436,6 +451,13 @@ namespace BeaverBuddies
             DesyncDetecterService.StartTick(ticksSinceLoad);
 
             IsLoaded = true;
+
+            // Loading and its initial randomization are now complete. Let the host
+            // release its first-tick barrier for this client.
+            if (io is ClientEventIO client)
+            {
+                client.NotifyLoaded();
+            }
         }
 
         // TODO: Find a better callback way of waiting until initial game
@@ -463,7 +485,50 @@ namespace BeaverBuddies
             {
                 DoTickIO();
             }
+            TryStartCoordinatedRehost();
             UpdateSpeed();
+        }
+
+        private void TryStartCoordinatedRehost()
+        {
+            if (coordinatedRehostStarted ||
+                !(io is ServerEventIO server) ||
+                !server.TryConsumeLateJoinRequest())
+            {
+                return;
+            }
+
+            coordinatedRehostStarted = true;
+            Plugin.Log("Late client requested a coordinated reload; finishing the current tick");
+            FinishFullTickIfNeededAndThen(() =>
+            {
+                if (!(io is ServerEventIO currentServer))
+                {
+                    coordinatedRehostStarted = false;
+                    return;
+                }
+
+                TargetSpeed = 0;
+                SpeedChangePatcher.SetSpeedSilentlyNow(_speedManager, 0);
+
+                // Consume any messages that reached the host before the checkpoint.
+                // Every peer will load the resulting save, so no historical replay
+                // is needed across synchronization epochs.
+                currentServer.Update();
+                DoTickIO();
+
+                int minimumReadyClients = currentServer.ClientCount + 1;
+                bool started = _rehostingService.RehostGame(() =>
+                {
+                    currentServer.NotifySessionRestart();
+                }, minimumReadyClients);
+                if (!started)
+                {
+                    currentServer.CancelSessionRestart();
+                    coordinatedRehostStarted = false;
+                    Plugin.LogError("Could not save a checkpoint for the late-joining client");
+                }
+            });
         }
 
         public void SetTargetSpeed(float speed)
@@ -555,10 +620,11 @@ namespace BeaverBuddies
             // Update speed and pause if needed for the new tick.
             UpdateSpeed();
 
-            if (io is ServerEventIO && ticksSinceLoad == 1)
+            if (io is ServerEventIO server && ticksSinceLoad == 1)
             {
-                ((ServerEventIO)io).StopAcceptingClients();
+                server.MarkGameStarted();
             }
+
         }
 
         public void FinishFullTickIfNeededAndThen(Action action)

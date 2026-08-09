@@ -20,25 +20,48 @@ namespace BeaverBuddies.IO
         public override UserEventBehavior UserEventBehavior => UserEventBehavior.Send;
 
         private MapReceived mapReceivedCallback;
-        private bool FailedToConnect = false;
+        private Action sessionRestartCallback;
+        private MessageReceived errorCallback;
+        private MessageReceived disconnectedCallback;
+        private MapTransferStarted mapTransferStartedCallback;
+        private readonly object cleanupLock = new object();
+        private volatile bool failedToConnect;
+
+        public void NotifyLoaded()
+        {
+            NetBase?.NotifyLoaded();
+        }
 
         private ClientEventIO(ISocketStream socket, MapReceived mapReceivedCallback,
-            Action<string> onError)
+            Action<string> onError, Action onSessionRestart, Action<string> onDisconnected,
+            Action<int> onMapTransferStarted)
         {
             this.mapReceivedCallback = mapReceivedCallback;
+            sessionRestartCallback = onSessionRestart;
 
             TryRegisterSteamPacketReceiver(socket);
 
             NetBase = new TimberClient(socket);
             NetBase.OnMapReceived += mapReceivedCallback;
+            mapTransferStartedCallback = mapLength => onMapTransferStarted(mapLength);
+            NetBase.OnMapTransferStarted += mapTransferStartedCallback;
+            NetBase.OnSessionRestart += sessionRestartCallback;
             NetBase.OnLog += Plugin.Log;
-            NetBase.OnError += (error) =>
+            errorCallback = error =>
             {
                 Plugin.LogError(error);
+                failedToConnect = true;
                 CleanUp();
-                FailedToConnect = true;
                 onError(error);
             };
+            disconnectedCallback = reason =>
+            {
+                Plugin.LogWarning($"Client disconnected: {reason}");
+                CleanUp();
+                onDisconnected(reason);
+            };
+            NetBase.OnError += errorCallback;
+            NetBase.OnDisconnected += disconnectedCallback;
             try
             {
                 NetBase.Start();
@@ -47,23 +70,41 @@ namespace BeaverBuddies.IO
             {
                 onError(ex.Message);
                 Plugin.LogError(ex.ToString());
+                failedToConnect = true;
                 CleanUp();
-                FailedToConnect = true;
             }
         }
 
         private void CleanUp()
         {
-            if (NetBase == null) return;
-            NetBase.OnMapReceived -= mapReceivedCallback;
-            NetBase.OnLog -= Plugin.Log;
-            NetBase = null;
+            lock (cleanupLock)
+            {
+                TimberClient netBase = NetBase;
+                if (netBase == null) return;
+                NetBase = null;
+                netBase.OnMapReceived -= mapReceivedCallback;
+                netBase.OnMapTransferStarted -= mapTransferStartedCallback;
+                netBase.OnSessionRestart -= sessionRestartCallback;
+                netBase.OnLog -= Plugin.Log;
+                netBase.OnError -= errorCallback;
+                netBase.OnDisconnected -= disconnectedCallback;
+                netBase.Close();
+            }
         }
 
-        public static ClientEventIO Create(ISocketStream socket, MapReceived mapReceivedCallback, Action<string> onError)
+        public override void Close()
         {
-            ClientEventIO eventIO = new ClientEventIO(socket, mapReceivedCallback, onError);
-            if (eventIO.FailedToConnect) return null;
+            CleanUp();
+        }
+
+        public static ClientEventIO Create(ISocketStream socket, MapReceived mapReceivedCallback,
+            Action<string> onError, Action onSessionRestart, Action<string> onDisconnected,
+            Action<int> onMapTransferStarted)
+        {
+            ClientEventIO eventIO = new ClientEventIO(
+                socket, mapReceivedCallback, onError, onSessionRestart, onDisconnected,
+                onMapTransferStarted);
+            if (eventIO.failedToConnect) return null;
             return eventIO;
         }
     }

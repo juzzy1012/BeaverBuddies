@@ -13,7 +13,9 @@ namespace TimberNet
         private readonly TcpClient client;
 
         public int MaxChunkSize => 8192 * 4; // 32K
-        public int MaxBytesPerSecond => 1024 * 1024; // 1 MB/s
+        // TCP already provides flow control and backpressure. Artificially
+        // throttling save transfers here made LAN joining needlessly slow.
+        public int MaxBytesPerSecond => int.MaxValue;
 
         public string? Name => null;
 
@@ -27,6 +29,7 @@ namespace TimberNet
         public TCPClientWrapper(TcpClient client)
         {
             this.client = client;
+            ConfigureSocket();
             address = null;
             port = 0;
         }
@@ -34,13 +37,21 @@ namespace TimberNet
         public bool Connected => client.Connected;
 
 
-        public Task ConnectAsync()
+        public async Task ConnectAsync()
         {
             if (address == null)
             {
                 throw new Exception("Client was initialized without an address.");
             }
-            return client.ConnectAsync(address, port);
+            await client.ConnectAsync(address, port).ConfigureAwait(false);
+            ConfigureSocket();
+        }
+
+        private void ConfigureSocket()
+        {
+            client.NoDelay = true;
+            client.Client.SetSocketOption(
+                SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
         }
 
         public void Close()

@@ -9,7 +9,7 @@ namespace TimberNet
     public class ConcurrentQueueWithWait<T>
     {
         private ConcurrentQueue<T> queue;
-        ManualResetEvent hasAvailable = new ManualResetEvent(false);
+        private readonly ManualResetEventSlim hasAvailable = new ManualResetEventSlim(false);
 
         public ConcurrentQueueWithWait()
         {
@@ -22,9 +22,10 @@ namespace TimberNet
             hasAvailable.Set();
         }
 
-        public bool WaitAndTryDequeue(out T item)
+        public bool WaitAndTryDequeue(out T item,
+            CancellationToken cancellationToken = default)
         {
-            Wait();
+            hasAvailable.Wait(cancellationToken);
             if (queue.TryDequeue(out item))
             {
                 hasAvailable.Reset();
@@ -37,10 +38,5 @@ namespace TimberNet
             return false;
         }
 
-        public void Wait()
-        {
-            hasAvailable.WaitOne();
-        }
-        
     }
 }

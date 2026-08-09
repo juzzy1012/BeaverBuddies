@@ -10,12 +10,17 @@ namespace TimberNet
     public class MultiSocketListener : ISocketListener
     {
         private readonly List<ISocketListener> listeners = new List<ISocketListener>();
+        private readonly List<ISocketListener> activeListeners = new List<ISocketListener>();
+        private readonly List<Exception> startFailures = new List<Exception>();
+        private readonly object lifecycleLock = new object();
 
         private readonly ConcurrentQueueWithWait<ISocketStream> accepted = new ConcurrentQueueWithWait<ISocketStream>();
+        private readonly CancellationTokenSource stopSource = new CancellationTokenSource();
         private bool isAccepting = false;
-        private bool isStopped = false;
+        private int isStopped;
 
         public IEnumerable<ISocketListener> Listeners => listeners;
+        public IEnumerable<Exception> StartFailures => startFailures;
 
         public MultiSocketListener(params ISocketListener[] listeners) 
         {
@@ -26,22 +31,40 @@ namespace TimberNet
         {
             if (!isAccepting)
             {
-                StartAccpting();
+                StartAccepting();
                 isAccepting = true;
             }
-            accepted.WaitAndTryDequeue(out ISocketStream socket);
+            accepted.WaitAndTryDequeue(out ISocketStream socket, stopSource.Token);
             return socket;
         }
 
-        private void StartAccpting()
+        private void StartAccepting()
         {
-            foreach (var listener in listeners)
+            List<ISocketListener> snapshot;
+            lock (lifecycleLock)
+            {
+                snapshot = new List<ISocketListener>(activeListeners);
+            }
+            foreach (var listener in snapshot)
             {
                 Task.Run(() =>
                 {
-                    while (!isStopped)
+                    while (Volatile.Read(ref isStopped) == 0)
                     {
-                        accepted.Enqueue(listener.AcceptClient());
+                        try
+                        {
+                            accepted.Enqueue(listener.AcceptClient());
+                        }
+                        catch when (Volatile.Read(ref isStopped) != 0)
+                        {
+                            break;
+                        }
+                        catch
+                        {
+                            // A transient listener failure should not permanently
+                            // disable the other transport or the accept loop.
+                            Thread.Sleep(100);
+                        }
                     }
                 });
             }
@@ -49,18 +72,65 @@ namespace TimberNet
 
         public void Start()
         {
-            listeners.ForEach(listener => listener.Start());
+            lock (lifecycleLock)
+            {
+                if (Volatile.Read(ref isStopped) != 0)
+                    throw new InvalidOperationException("Listener has already been stopped.");
+                if (activeListeners.Count > 0)
+                    return;
+
+                startFailures.Clear();
+                foreach (ISocketListener listener in listeners)
+                {
+                    try
+                    {
+                        listener.Start();
+                        activeListeners.Add(listener);
+                    }
+                    catch (Exception exception)
+                    {
+                        startFailures.Add(exception);
+                    }
+                }
+
+                if (activeListeners.Count == 0)
+                {
+                    throw new AggregateException(
+                        "None of the configured transports could start.", startFailures);
+                }
+            }
         }
 
         public void Stop()
         {
-            listeners.ForEach(listener => listener.Stop());
-            isStopped = true;
+            Interlocked.Exchange(ref isStopped, 1);
+            stopSource.Cancel();
+            List<ISocketListener> snapshot;
+            lock (lifecycleLock)
+            {
+                snapshot = new List<ISocketListener>(activeListeners);
+                activeListeners.Clear();
+            }
+            foreach (ISocketListener listener in snapshot)
+            {
+                try
+                {
+                    listener.Stop();
+                }
+                catch
+                {
+                    // Continue stopping the other transport. A broken Steam
+                    // listener must not leave the TCP accept thread alive.
+                }
+            }
         }
 
         public T GetListener<T>()
         {
-            return (T)listeners.Find(listener => listener is T);
+            lock (lifecycleLock)
+            {
+                return (T)activeListeners.Find(listener => listener is T);
+            }
         }
     }
 }

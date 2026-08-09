@@ -750,9 +750,16 @@ namespace BeaverBuddies
             }
             replayService.FinishFullTickIfNeededAndThen(() =>
             {
+                bool wasSaving = IsSaving;
                 IsSaving = true;
-                original(instance, queuedSave);
-                IsSaving = false;
+                try
+                {
+                    original(instance, queuedSave);
+                }
+                finally
+                {
+                    IsSaving = wasSaving;
+                }
             });
         }
     }
@@ -761,11 +768,20 @@ namespace BeaverBuddies
     public class AutosaverCreateExitSavePatcher
     {
 
-        static void Prefix()
+        static void Prefix(out bool __state)
         {
             // Go straight to saving since we're going to exit
             // and don't need to keep clients in sync
+            __state = GameSaverSavePatcher.IsSaving;
             GameSaverSavePatcher.IsSaving = true;
+        }
+
+        static Exception Finalizer(Exception __exception, bool __state)
+        {
+            // CreateExitSave is synchronous. Restore the prior state even when
+            // the save fails so returning to the menu cannot poison the next game.
+            GameSaverSavePatcher.IsSaving = __state;
+            return __exception;
         }
     }
 

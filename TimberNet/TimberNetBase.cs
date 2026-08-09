@@ -22,20 +22,31 @@ namespace TimberNet
         public const string TYPE_KEY = "type";
         public const string SET_STATE_EVENT = "SetState";
         public const string HEARTBEAT_EVENT = "Heartbeat";
+        public const string CLIENT_READY_EVENT = "ClientReady";
+        public const string SESSION_RESTART_EVENT = "SessionRestart";
+        public const string SESSION_RESTART_REQUIRED = "BeaverBuddies.SessionRestartRequired";
+        public const string READY_TOKEN_KEY = "readyToken";
         public const int MAX_BUFFER_SIZE = 8192 * 4; // 32K
+        public const int MAX_EVENT_SIZE = 8 * 1024 * 1024;
+        public const int MAX_MAP_SIZE = 512 * 1024 * 1024;
+        public const int MAX_ERROR_SIZE = 64 * 1024;
 
         public delegate void MessageReceived(string message);
         public delegate void MapReceived(byte[] mapBytes);
+        public delegate void MapTransferStarted(int mapLength);
 
         public event MessageReceived? OnLog;
         public event MessageReceived? OnError;
+        public event MessageReceived? OnDisconnected;
         public event MapReceived? OnMapReceived;
+        public event MapTransferStarted? OnMapTransferStarted;
 
         private readonly ConcurrentQueue<string> receivedEventQueue = new ConcurrentQueue<string>();
         private readonly ConcurrentQueue<string> logQueue = new ConcurrentQueue<string>();
         private byte[]? mapBytes = null;
 
-        public bool IsStopped { get; private set; } = false;
+        private int stopped;
+        public bool IsStopped => Volatile.Read(ref stopped) != 0;
 
         public int Hash { get; private set; } = 17;
 
@@ -59,7 +70,7 @@ namespace TimberNet
 
         public virtual void Close()
         {
-            IsStopped = true;
+            Interlocked.Exchange(ref stopped, 1);
         }
 
         public TimberNetBase()
@@ -77,6 +88,16 @@ namespace TimberNet
             // Should be threadsafe
             OnLog?.Invoke($"T{ticks.ToString("D4")} [{hash.ToString("X8")}] : {message}");
             //logQueue.Enqueue($"T{ticks.ToString("D4")} [{hash.ToString("X8")}] : {message}");
+        }
+
+        protected void ReportError(string message)
+        {
+            OnError?.Invoke(message);
+        }
+
+        private void ReportDisconnected(string message)
+        {
+            OnDisconnected?.Invoke(message);
         }
 
         public virtual void Start()
@@ -176,18 +197,29 @@ namespace TimberNet
 
         protected void SendDataWithLength(ISocketStream stream, byte[] data)
         {
-            SendLength(stream, data.Length);
-            int chunkSize = stream.MaxChunkSize;
-            // How long to sleep between chunks (may be 0)
-            int sleepMS = stream.MaxChunkSize * 1000 / stream.MaxBytesPerSecond;
-            for (int i = 0; i < data.Length; i += chunkSize)
+            if (data == null)
+                throw new ArgumentNullException(nameof(data));
+
+            // A length-prefixed message is one atomic frame. Multiple client
+            // setup and gameplay tasks may write to the same stream.
+            lock (stream)
             {
-                if (i != 0)
+                SendLength(stream, data.Length);
+                int chunkSize = stream.MaxChunkSize;
+                if (chunkSize <= 0 || stream.MaxBytesPerSecond <= 0)
+                    throw new InvalidOperationException("Socket stream has invalid transfer limits.");
+
+                // How long to sleep between chunks (may be 0).
+                int sleepMS = chunkSize * 1000 / stream.MaxBytesPerSecond;
+                for (int i = 0; i < data.Length; i += chunkSize)
                 {
-                    Thread.Sleep(sleepMS);
+                    if (i != 0 && sleepMS > 0)
+                    {
+                        Thread.Sleep(sleepMS);
+                    }
+                    int length = Math.Min(chunkSize, data.Length - i);
+                    stream.Write(data, i, length);
                 }
-                int length = Math.Min(chunkSize, data.Length - i);
-                stream.Write(data, i, length);
             }
         }
 
@@ -198,10 +230,19 @@ namespace TimberNet
 
             try
             {
+                if (buffer.Length > MAX_EVENT_SIZE)
+                {
+                    throw new InvalidDataException(
+                        $"Event frame is {buffer.Length} bytes; maximum is {MAX_EVENT_SIZE}.");
+                }
                 SendDataWithLength(client, buffer);
             } catch (Exception e)
             {
                 Log($"Error sending event: {e.Message}");
+                // Reliable transports either deliver the complete ordered frame or
+                // the session is no longer safe to continue. Leaving the peer in
+                // the client list after a failed write creates a silent desync.
+                client.Close();
             }
         }
 
@@ -226,40 +267,77 @@ namespace TimberNet
 
         protected void StartListening(ISocketStream client, bool isClient)
         {
-            //Log("Client connected");
             int messageCount = 0;
-            while (client.Connected && !IsStopped)
+            bool terminalMessageHandled = false;
+            string disconnectReason = "Connection closed.";
+            try
             {
-                if (!TryReadLength(client, out int messageLength)) break;
-
-                // First message is always the file
-                if (messageCount == 0 && isClient)
+                while (client.Connected && !IsStopped)
                 {
-                    if (messageLength == 0)
+                    if (!TryReadLength(client, out int messageLength))
                     {
-                        ReadErrorMessage(client);
-                        return;
+                        disconnectReason = "Connection closed while reading a frame header.";
+                        break;
                     }
 
-                    ReceiveFile(client, messageLength);
+                    // The first server-to-client frame is always the save file,
+                    // except for a zero-length retry/error sentinel.
+                    if (messageCount == 0 && isClient)
+                    {
+                        if (messageLength == 0)
+                        {
+                            ReadErrorMessage(client);
+                            terminalMessageHandled = true;
+                            return;
+                        }
+                        ValidateFrameLength(messageLength, MAX_MAP_SIZE, "map");
+                        ReportMapTransferStarted(messageLength);
+                        ReceiveFile(client, messageLength);
+                        messageCount++;
+                        continue;
+                    }
+
+                    ValidateFrameLength(messageLength, MAX_EVENT_SIZE, "event");
+                    byte[] buffer = client.ReadUntilComplete(messageLength);
+                    string message = BufferToStringMessage(buffer);
+                    receivedEventQueue.Enqueue(message);
                     messageCount++;
-                    continue;
                 }
-
-                if (messageLength == 0)
+            }
+            catch (Exception exception)
+            {
+                disconnectReason = exception.Message;
+                Log($"Connection listener stopped: {exception}");
+            }
+            finally
+            {
+                if (isClient && !IsStopped && !terminalMessageHandled)
                 {
-                    Log("Received message of length 0; aborting listen");
-                    break;
+                    ReportDisconnected(disconnectReason);
                 }
+            }
+        }
 
-                //Log($"Starting to read {messageLength} bytes");
-                // TODO: How should this fail and not hang if map stops sending?
-                byte[] buffer = client.ReadUntilComplete(messageLength);
+        private void ReportMapTransferStarted(int mapLength)
+        {
+            try
+            {
+                OnMapTransferStarted?.Invoke(mapLength);
+            }
+            catch (Exception exception)
+            {
+                // Progress observers must never be able to terminate the protocol
+                // reader. They are advisory and do not affect synchronization.
+                Log($"Map transfer observer failed: {exception}");
+            }
+        }
 
-                string message = BufferToStringMessage(buffer);
-                //Log($"Queuing message of length {messageLength} bytes");
-                receivedEventQueue.Enqueue(message);
-                messageCount++;
+        private static void ValidateFrameLength(int length, int maximum, string frameType)
+        {
+            if (length <= 0 || length > maximum)
+            {
+                throw new InvalidDataException(
+                    $"Invalid {frameType} frame length {length}; expected 1-{maximum} bytes.");
             }
         }
 
@@ -283,13 +361,13 @@ namespace TimberNet
         {
             if (TryReadLength(stream, out int length))
             {
+                ValidateFrameLength(length, MAX_ERROR_SIZE, "error");
                 byte[] bytes = stream.ReadUntilComplete(length);
                 string message = BufferToStringMessage(bytes);
-                if (OnError != null)
-                {
-                    OnError(message);
-                }
+                ReportError(message);
+                return;
             }
+            throw new IOException("Connection closed while reading an error response.");
         }
 
         public static int CombineHash(int h1, int h2)
@@ -327,7 +405,7 @@ namespace TimberNet
             byte[] mapBytes = stream.ReadUntilComplete(messageLength);
             AddFileToHash(mapBytes);
             Log($"Received map with length {mapBytes.Length} and Hash: {GetHashCode(mapBytes).ToString("X8")}");
-            this.mapBytes = mapBytes;
+            Volatile.Write(ref this.mapBytes, mapBytes);
         }
 
         private void ProcessReceivedEventsQueue()
@@ -363,9 +441,9 @@ namespace TimberNet
 
         private void ProcessReceivedMap()
         {
-            if (mapBytes == null) return;
-            OnMapReceived?.Invoke(mapBytes);
-            mapBytes = null;
+            byte[]? receivedMap = Interlocked.Exchange(ref mapBytes, null);
+            if (receivedMap == null) return;
+            OnMapReceived?.Invoke(receivedMap);
         }
 
         /**

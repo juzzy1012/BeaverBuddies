@@ -28,15 +28,18 @@ namespace BeaverBuddies.Steam
         public int MaxChunkSize => MAX_CHUNK_SIZE;
 
 
-        public bool Connected { get; private set; }
-
         public string Name { get; private set; }
 
         public readonly CSteamID friendID;
         //public readonly CSteamID lobbyID;
 
         private readonly ConcurrentQueueWithWait<byte[]> readBuffer = new ConcurrentQueueWithWait<byte[]>();
+        private readonly CancellationTokenSource closeSource = new CancellationTokenSource();
+        private byte[] currentReadBuffer;
         private int readOffset = 0;
+        private int connected;
+        private int closed;
+        private readonly bool outboundConnection;
 
         private SteamPacketListener packetListener;
 
@@ -44,49 +47,101 @@ namespace BeaverBuddies.Steam
         {
             this.friendID = friendID;
             Name = SteamFriends.GetFriendPersonaName(friendID);
-            Connected = autoconnect;
+            connected = autoconnect ? 1 : 0;
+            outboundConnection = !autoconnect;
+            if (outboundConnection)
+            {
+                SteamOverlayConnectionService.PeerDisconnected += OnPeerDisconnected;
+            }
         }
+
+        public bool Connected => Volatile.Read(ref connected) != 0;
 
         public void RegisterSteamPacketListener(SteamPacketListener listener)
         {
             packetListener = listener;
-            listener.RegisterSocket(this);
+            if (!listener.TryRegisterSocket(this))
+            {
+                packetListener = null;
+                throw new InvalidOperationException(
+                    $"A Steam connection for {friendID} is already registered.");
+            }
         }
 
         public Task ConnectAsync()
         {
+            if (Volatile.Read(ref closed) != 0)
+            {
+                throw new IOException("Steam connection is closed.");
+            }
             // This is the client joining, and this only gets called when
             // we've already joined the lobby. It automatically closes
             // the prior client (I think).
-            Connected = true;
+            Interlocked.Exchange(ref connected, 1);
             Plugin.Log("SteamSocket requested to connect!");
+            // A dedicated control-channel packet makes reconnects work even
+            // after the host creates a replacement lobby. It causes Steam to
+            // raise P2PSessionRequest_t on the host without entering TimberNet's
+            // ordered byte stream on channel 0.
+            byte[] probe = { 0x42, 0x42 };
+            if (!SteamNetworking.SendP2PPacket(
+                friendID, probe, (uint)probe.Length,
+                EP2PSend.k_EP2PSendReliable, 1))
+            {
+                Interlocked.Exchange(ref connected, 0);
+                throw new IOException("Steam rejected the connection probe.");
+            }
             return Task.CompletedTask;
         }
 
         public void Close()
         {
-            Connected = false;
+            if (Interlocked.Exchange(ref closed, 1) != 0)
+            {
+                return;
+            }
+            Interlocked.Exchange(ref connected, 0);
+            closeSource.Cancel();
+            if (outboundConnection)
+            {
+                SteamOverlayConnectionService.PeerDisconnected -= OnPeerDisconnected;
+            }
             packetListener?.UnregisterSocket(this);
+            SteamNetworking.CloseP2PSessionWithUser(friendID);
+        }
+
+        private void OnPeerDisconnected(CSteamID remoteSteamID)
+        {
+            if (remoteSteamID == friendID)
+            {
+                Close();
+            }
         }
 
         public int Read(byte[] buffer, int offset, int count)
         {
             // Block until we've read something
-            byte[] result;
-            while (!readBuffer.WaitAndTryDequeue(out result)) { }
-            int bytesToCopy = Math.Min(count, result.Length - readOffset);
-            Array.Copy(result, readOffset, buffer, offset, bytesToCopy);
-            if (result.Length > bytesToCopy)
-            {
-                // This will fail we ever receive multiple messages in a single packet.
-                // I don't think that can happen right now unless Steam merges packets, which
-                // seems not to happen... but we should log a more useful
-                // warning. And right now the "readOffset" should always be 0.
-                Plugin.LogWarning($"SteamSocket read {bytesToCopy} bytes, but {result.Length - bytesToCopy} bytes were left over. This is probably a bug!");
-                readOffset = bytesToCopy;
-            }
-            //Plugin.Log($"SteamSocket receiving {bytesToCopy} bytes");
+            if (!Connected)
+                throw new IOException("Steam connection is closed.");
 
+            try
+            {
+                while (currentReadBuffer == null &&
+                    !readBuffer.WaitAndTryDequeue(out currentReadBuffer, closeSource.Token)) { }
+            }
+            catch (OperationCanceledException)
+            {
+                throw new IOException("Steam connection was closed while reading.");
+            }
+
+            int bytesToCopy = Math.Min(count, currentReadBuffer.Length - readOffset);
+            Array.Copy(currentReadBuffer, readOffset, buffer, offset, bytesToCopy);
+            readOffset += bytesToCopy;
+            if (readOffset == currentReadBuffer.Length)
+            {
+                currentReadBuffer = null;
+                readOffset = 0;
+            }
             return bytesToCopy;
         }
 
@@ -96,6 +151,8 @@ namespace BeaverBuddies.Steam
             {
                 throw new IOException($"Attempted to write {buffer.Length} bytes, which exceeds the max chunk size of {MaxChunkSize} bytes.");
             }
+            if (!Connected)
+                throw new IOException("Steam connection is closed.");
             if (offset > 0)
             {
                 // Make a copy to avoid modifying the caller's buffer
@@ -104,12 +161,19 @@ namespace BeaverBuddies.Steam
                 buffer = newBuffer;
             }
             Plugin.Log($"SteamSocket sending {count} bytes");
-            SteamNetworking.SendP2PPacket(friendID, buffer, (uint)count, EP2PSend.k_EP2PSendReliable);
+            if (!SteamNetworking.SendP2PPacket(
+                friendID, buffer, (uint)count, EP2PSend.k_EP2PSendReliable))
+            {
+                throw new IOException("Steam rejected the outgoing packet.");
+            }
         }
 
         public void ReceiveData(byte[] data)
         {
-            readBuffer.Enqueue(data);
+            if (Connected)
+            {
+                readBuffer.Enqueue(data);
+            }
         }
     }
 }

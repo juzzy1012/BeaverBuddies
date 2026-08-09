@@ -17,6 +17,17 @@ namespace BeaverBuddies.Steam
     class SteamOverlayConnectionService : IUpdatableSingleton
     {
         public static bool IsSteamEnabled { get; private set; } = false;
+#if IS_STEAM
+        public static event Action<CSteamID> PeerDisconnected;
+#else
+        // SteamSocket is compiled in non-Steam builds but can never be created.
+        // Keep its subscription site valid without an unused backing field.
+        public static event Action<CSteamID> PeerDisconnected
+        {
+            add { }
+            remove { }
+        }
+#endif
 
 #if IS_STEAM
         private SteamManager _steamManager;
@@ -69,7 +80,9 @@ namespace BeaverBuddies.Steam
                     //Callback<LobbyChatUpdate_t>.Create(OnLobbyChatUpdate);
                     callbacks.Add(Callback<GameLobbyJoinRequested_t>.Create(OnLobbyJoinRequested));
                     callbacks.Add(Callback<LobbyEnter_t>.Create(OnLobbyEntered));
+                    callbacks.Add(Callback<LobbyChatUpdate_t>.Create(OnLobbyChatUpdate));
                     callbacks.Add(Callback<P2PSessionRequest_t>.Create(OnP2PSessionRequest));
+                    callbacks.Add(Callback<P2PSessionConnectFail_t>.Create(OnP2PSessionConnectFail));
 
                     //SteamMatchmaking.CreateLobby(ELobbyType.k_ELobbyTypeFriendsOnly, 4);
 
@@ -108,19 +121,21 @@ namespace BeaverBuddies.Steam
 
         private void OnLobbyChatUpdate(LobbyChatUpdate_t callback)
         {
-            Debug.Log("Lobby chat update: " + callback.m_ulSteamIDLobby);
-            if ((callback.m_rgfChatMemberStateChange & (uint)EChatMemberStateChange.k_EChatMemberStateChangeEntered) != 0)
+            uint departed =
+                (uint)EChatMemberStateChange.k_EChatMemberStateChangeLeft |
+                (uint)EChatMemberStateChange.k_EChatMemberStateChangeDisconnected |
+                (uint)EChatMemberStateChange.k_EChatMemberStateChangeKicked |
+                (uint)EChatMemberStateChange.k_EChatMemberStateChangeBanned;
+            if ((callback.m_rgfChatMemberStateChange & departed) != 0)
             {
-                CSteamID userJoined = new CSteamID(callback.m_ulSteamIDUserChanged);
-                string name = SteamFriends.GetFriendPersonaName(userJoined);
-                Debug.Log("User " + name + " has joined the lobby.");
-
-
-                //SteamNetworking.CreateP2PConnectionSocket(memberId, 0, )
-                string message = "Hello, beaver buddy!";
-                byte[] data = Encoding.UTF8.GetBytes(message);
-                SteamNetworking.SendP2PPacket(userJoined, data, (uint)data.Length, EP2PSend.k_EP2PSendReliable);
+                PeerDisconnected?.Invoke(
+                    new CSteamID(callback.m_ulSteamIDUserChanged));
             }
+        }
+
+        private void OnP2PSessionConnectFail(P2PSessionConnectFail_t callback)
+        {
+            PeerDisconnected?.Invoke(callback.m_steamIDRemote);
         }
 
         private void OnLobbyInvite(LobbyInvite_t param)

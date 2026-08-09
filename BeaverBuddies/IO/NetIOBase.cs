@@ -20,7 +20,7 @@ namespace BeaverBuddies.IO
 
         private SteamPacketListener steamPacketListener = null;
 
-        public void Close()
+        public virtual void Close()
         {
             if (NetBase == null) return;
             NetBase.Close();

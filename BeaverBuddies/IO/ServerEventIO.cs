@@ -38,7 +38,7 @@ namespace BeaverBuddies.IO
 
         // The map remains static for this synchronization epoch. A late join
         // creates a new checkpoint and therefore a new ServerEventIO instance.
-        public void Start(byte[] mapBytes, int minimumReadyClients = 0)
+        public bool Start(byte[] mapBytes, int minimumReadyClients = 0)
         {
             try
             {
@@ -63,28 +63,32 @@ namespace BeaverBuddies.IO
                 }
                 NetBase = new TimberServer(
                     SocketListener,
-                    () =>
-                    {
-                        // TODO: Probably don't need to hold it in memory after the first tick...
-                        Task<byte[]> task = new Task<byte[]>(() => mapBytes);
-                        task.Start();
-                        return task;
-                    },
+                    () => Task.FromResult(mapBytes),
                     CreateInitEvent(),
                     minimumReadyClients
                 );
+
+                NetBase.OnLog += Plugin.Log;
+                NetBase.OnMapReceived += NetBase_OnClientConnected;
+                NetBase.OnLateJoinRequested += () => Interlocked.Exchange(ref lateJoinRequested, 1);
+                NetBase.Start();
+                return true;
             }
             catch (Exception e)
             {
                 Plugin.Log("Failed to start server");
                 Plugin.Log(e.ToString());
-                return;
+                try
+                {
+                    NetBase?.Close();
+                }
+                catch (Exception closeException)
+                {
+                    Plugin.Log(closeException.ToString());
+                }
+                NetBase = null;
+                return false;
             }
-            //netBase = new TimberServer(port, mapProvider, null);
-            NetBase.OnLog += Plugin.Log;
-            NetBase.OnMapReceived += NetBase_OnClientConnected;
-            NetBase.OnLateJoinRequested += () => Interlocked.Exchange(ref lateJoinRequested, 1);
-            NetBase.Start();
         }
 
         public bool TryConsumeLateJoinRequest()
@@ -105,6 +109,11 @@ namespace BeaverBuddies.IO
         public void CancelSessionRestart()
         {
             NetBase?.CancelSessionRestart();
+        }
+
+        public void AllowStartingWithConnectedClients()
+        {
+            NetBase?.AllowStartingWithConnectedClients();
         }
 
         private Func<JObject> CreateInitEvent()

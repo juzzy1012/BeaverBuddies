@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace TimberNet
@@ -15,11 +16,16 @@ namespace TimberNet
 
     public class TimberClient : TimberNetBase
     {
+        private static readonly TimeSpan ConnectionTimeout = TimeSpan.FromSeconds(3);
+        private static readonly TimeSpan InitialResponseTimeout = TimeSpan.FromSeconds(30);
 
         private readonly ISocketStream client;
         private string? readyToken;
         private bool hasFinishedLoading;
         private bool readyNotificationSent;
+        private int initialResponseState;
+        private readonly CancellationTokenSource responseTimeoutSource =
+            new CancellationTokenSource();
 
         public event Action? OnSessionRestart;
 
@@ -28,6 +34,8 @@ namespace TimberNet
         public TimberClient(ISocketStream client) : base()
         {
             this.client = client;
+            OnMapTransferStarted += _ => CompleteInitialResponse();
+            OnError += _ => CompleteInitialResponse();
         }
 
         public override void DoUserInitiatedEvent(JObject message)
@@ -88,20 +96,77 @@ namespace TimberNet
         public override void Start()
         {
             base.Start();
-            // TODO: Handle async properly and cleanup
-            // TODO: Make wait configurable?
-            if (!client.ConnectAsync().Wait(3000))
+            Task.Run(ConnectAndListen);
+        }
+
+        private async Task ConnectAndListen()
+        {
+            try
             {
-                throw new ConnectionFailureException();
+                Task connection = client.ConnectAsync();
+                Task completed = await Task.WhenAny(
+                    connection, Task.Delay(ConnectionTimeout)).ConfigureAwait(false);
+                if (completed != connection)
+                {
+                    client.Close();
+                    _ = connection.ContinueWith(
+                        task => _ = task.Exception,
+                        CancellationToken.None,
+                        TaskContinuationOptions.OnlyOnFaulted,
+                        TaskScheduler.Default);
+                    throw new ConnectionFailureException();
+                }
+
+                await connection.ConfigureAwait(false);
+                if (!IsStopped)
+                {
+                    _ = Task.Delay(InitialResponseTimeout, responseTimeoutSource.Token).ContinueWith(
+                        _ => CheckInitialResponseTimeout(),
+                        CancellationToken.None,
+                        TaskContinuationOptions.ExecuteSynchronously |
+                            TaskContinuationOptions.OnlyOnRanToCompletion,
+                        TaskScheduler.Default);
+                    StartListening(client, true);
+                }
             }
-            // Connect a TCP socket at the address
-            Task.Run(() => StartListening(client, true));
+            catch (Exception exception)
+            {
+                if (!IsStopped)
+                {
+                    ReportError(exception.GetBaseException().Message);
+                }
+            }
+        }
+
+        private void CompleteInitialResponse()
+        {
+            if (Interlocked.CompareExchange(ref initialResponseState, 1, 0) == 0)
+            {
+                responseTimeoutSource.Cancel();
+            }
+        }
+
+        private void CheckInitialResponseTimeout()
+        {
+            if (!IsStopped &&
+                Interlocked.CompareExchange(ref initialResponseState, -1, 0) == 0)
+            {
+                try
+                {
+                    ReportError("The host accepted the connection but did not begin sending a save.");
+                }
+                finally
+                {
+                    client.Close();
+                }
+            }
         }
 
 
         public override void Close()
         {
             base.Close();
+            responseTimeoutSource.Cancel();
             client.Close();
         }
     }

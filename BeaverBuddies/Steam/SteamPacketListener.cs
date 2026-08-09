@@ -10,15 +10,64 @@ namespace BeaverBuddies.Steam
     public class SteamPacketListener
     {
         private Dictionary<CSteamID, SteamSocket> sockets = new Dictionary<CSteamID, SteamSocket>();
+        private readonly object socketsLock = new object();
 
-        public void RegisterSocket(SteamSocket socket)
+        public bool TryRegisterSocket(SteamSocket socket)
         {
-            sockets[socket.friendID] = socket;
+            lock (socketsLock)
+            {
+                if (sockets.TryGetValue(socket.friendID, out SteamSocket existing) &&
+                    existing.Connected)
+                {
+                    return ReferenceEquals(existing, socket);
+                }
+                sockets[socket.friendID] = socket;
+                return true;
+            }
+        }
+
+        public bool HasConnectedSocket(CSteamID remoteSteamID)
+        {
+            lock (socketsLock)
+            {
+                return sockets.TryGetValue(remoteSteamID, out SteamSocket socket) &&
+                    socket.Connected;
+            }
         }
 
         public void UnregisterSocket(SteamSocket socket)
         {
-            sockets.Remove(socket.friendID);
+            lock (socketsLock)
+            {
+                if (sockets.TryGetValue(socket.friendID, out SteamSocket registered) &&
+                    ReferenceEquals(registered, socket))
+                {
+                    sockets.Remove(socket.friendID);
+                }
+            }
+        }
+
+        public void CloseSocket(CSteamID remoteSteamID)
+        {
+            SteamSocket socket = null;
+            lock (socketsLock)
+            {
+                sockets.TryGetValue(remoteSteamID, out socket);
+            }
+            socket?.Close();
+        }
+
+        public void CloseAllSockets()
+        {
+            List<SteamSocket> toClose;
+            lock (socketsLock)
+            {
+                toClose = new List<SteamSocket>(sockets.Values);
+            }
+            foreach (SteamSocket socket in toClose)
+            {
+                socket.Close();
+            }
         }
 
         public void Update()
@@ -45,9 +94,14 @@ namespace BeaverBuddies.Steam
                     //    Plugin.Log("Data: " + CompressionUtils.Decompress(buffer));
                     //}
 
-                    if (sockets.ContainsKey(remoteSteamID))
+                    SteamSocket socket;
+                    lock (socketsLock)
                     {
-                        sockets[remoteSteamID].ReceiveData(buffer);
+                        sockets.TryGetValue(remoteSteamID, out socket);
+                    }
+                    if (socket != null)
+                    {
+                        socket.ReceiveData(buffer);
                     }
                     else
                     {

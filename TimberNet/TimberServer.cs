@@ -16,7 +16,7 @@ namespace TimberNet
         private readonly Dictionary<ISocketStream, string> clientReadyTokens =
             new Dictionary<ISocketStream, string>();
         private readonly HashSet<string> readyClients = new HashSet<string>();
-        private readonly int minimumReadyClients;
+        private int minimumReadyClients;
 
         private readonly ISocketListener listener;
         private Func<Task<byte[]>> mapProvider;
@@ -24,6 +24,8 @@ namespace TimberNet
         private int nextReadyToken;
         private int coordinatedRestartRequested;
         private bool gameStarted;
+        private int hashBeforeInitialization;
+        private JObject? initializationEvent;
 
         private string? errorMessage;
 
@@ -56,6 +58,7 @@ namespace TimberNet
         }
 
         public bool IsAcceptingClients => errorMessage == null;
+        public int MinimumReadyClients => Volatile.Read(ref minimumReadyClients);
 
         public TimberServer(
             ISocketListener listener,
@@ -93,6 +96,16 @@ namespace TimberNet
                 gameStarted = true;
             }
             Log("Session is running; future joins will create a coordinated checkpoint");
+        }
+
+        public void AllowStartingWithConnectedClients()
+        {
+            lock (queuedMessages)
+            {
+                RemoveDisconnectedClients();
+                minimumReadyClients = clients.Count;
+                Log($"Ready barrier manually reduced to {minimumReadyClients} connected clients");
+            }
         }
 
         public void CancelSessionRestart()
@@ -142,8 +155,27 @@ namespace TimberNet
         public override void Start()
         {
             base.Start();
+
+            // Every client in this synchronization epoch receives the same
+            // initialization event exactly once. Recreating and broadcasting it
+            // for each joining client races concurrent map transfers and changes
+            // the deterministic hash based on connection order.
+            hashBeforeInitialization = Hash;
+            if (initEventProvider != null)
+            {
+                initializationEvent = initEventProvider();
+                base.DoUserInitiatedEvent(initializationEvent);
+            }
+
             listener.Start();
             Log("Server started listening");
+            if (listener is MultiSocketListener multiSocketListener)
+            {
+                foreach (Exception failure in multiSocketListener.StartFailures)
+                {
+                    Log($"A network transport could not start; continuing with the others: {failure}");
+                }
+            }
 
             Task.Run(() =>
             {
@@ -190,11 +222,9 @@ namespace TimberNet
 
                 await SendMap(client);
                 SendState(client);
-                if (initEventProvider != null)
+                if (initializationEvent != null)
                 {
-                    // Broadcast the initialization event so every peer advances
-                    // the event hash in the same order.
-                    DoUserInitiatedEvent(initEventProvider(), true);
+                    SendEvent(client, (JObject)initializationEvent.DeepClone());
                 }
                 FinishQueuing(client);
 
@@ -304,14 +334,26 @@ namespace TimberNet
 
         private void SendErrorMessage(ISocketStream client, string message)
         {
-            SendLength(client, 0);
-            SendDataWithLength(client, MessageToBuffer(message));
+            byte[] payload = MessageToBuffer(message);
+            if (payload.Length > MAX_ERROR_SIZE)
+                throw new InvalidOperationException("Error response exceeds the protocol limit.");
+
+            lock (client)
+            {
+                SendLength(client, 0);
+                SendDataWithLength(client, payload);
+            }
         }
 
         private async Task SendMap(ISocketStream client)
         {
             Log("Waiting for map...");
             byte[] mapBytes = await mapProvider();
+            if (mapBytes == null || mapBytes.Length == 0 || mapBytes.Length > MAX_MAP_SIZE)
+            {
+                throw new InvalidOperationException(
+                    $"Map size must be between 1 and {MAX_MAP_SIZE} bytes.");
+            }
             Log($"Sending map with length {mapBytes.Length}");
             SendDataWithLength(client, mapBytes);
             Log($"Sent map with length {mapBytes.Length} and Hash: {GetHashCode(mapBytes):X8}");
@@ -323,7 +365,7 @@ namespace TimberNet
             {
                 [TICKS_KEY] = 0,
                 [TYPE_KEY] = SET_STATE_EVENT,
-                ["hash"] = Hash,
+                ["hash"] = hashBeforeInitialization,
             };
             lock (queuedMessages)
             {
@@ -332,29 +374,14 @@ namespace TimberNet
             SendEvent(client, message);
         }
 
-        private void DoUserInitiatedEvent(JObject message, bool sendNow)
+        public override void DoUserInitiatedEvent(JObject message)
         {
             base.DoUserInitiatedEvent(message);
             lock (queuedMessages)
             {
                 RemoveDisconnectedClients();
-                clients.ForEach(client =>
-                {
-                    if (sendNow)
-                    {
-                        SendEvent(client, message);
-                    }
-                    else
-                    {
-                        QueueOrSendToClient(client, message);
-                    }
-                });
+                clients.ForEach(client => QueueOrSendToClient(client, message));
             }
-        }
-
-        public override void DoUserInitiatedEvent(JObject message)
-        {
-            DoUserInitiatedEvent(message, false);
         }
 
         private void QueueOrSendToClient(ISocketStream client, JObject message)

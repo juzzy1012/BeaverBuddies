@@ -14,6 +14,7 @@ namespace BeaverBuddies.Steam
 
         private List<IDisposable> callbacks = new List<IDisposable>();
         private ConcurrentQueueWithWait<SteamSocket> joiningUsers = new ConcurrentQueueWithWait<SteamSocket>();
+        private readonly CancellationTokenSource stopSource = new CancellationTokenSource();
         private SteamPacketListener steamPacketListener;
 
         public SteamListener()
@@ -38,6 +39,7 @@ namespace BeaverBuddies.Steam
             Plugin.Log("SteamListener started...");
             callbacks.Add(Callback<LobbyChatUpdate_t>.Create(OnLobbyChatUpdate));
             callbacks.Add(Callback<LobbyCreated_t>.Create(OnLobbyCreated));
+            callbacks.Add(Callback<P2PSessionRequest_t>.Create(OnP2PSessionRequest));
             SteamMatchmaking.CreateLobby(ELobbyType.k_ELobbyTypeFriendsOnly, 8);
         }
 
@@ -66,22 +68,46 @@ namespace BeaverBuddies.Steam
             if ((callback.m_rgfChatMemberStateChange & (uint)EChatMemberStateChange.k_EChatMemberStateChangeEntered) != 0)
             {
                 CSteamID userJoined = new CSteamID(callback.m_ulSteamIDUserChanged);
-                
-                // Don't include in release
-                //string name = SteamFriends.GetFriendPersonaName(userJoined);
-                //Plugin.Log("User " + name + " has joined the lobby.");
-
-                var socket = new SteamSocket(userJoined, true);
-                steamPacketListener.RegisterSocket(socket);
-                joiningUsers.Enqueue(socket);
+                AcceptUser(userJoined);
+                return;
             }
+
+            uint departed =
+                (uint)EChatMemberStateChange.k_EChatMemberStateChangeLeft |
+                (uint)EChatMemberStateChange.k_EChatMemberStateChangeDisconnected |
+                (uint)EChatMemberStateChange.k_EChatMemberStateChangeKicked |
+                (uint)EChatMemberStateChange.k_EChatMemberStateChangeBanned;
+            if ((callback.m_rgfChatMemberStateChange & departed) != 0)
+            {
+                steamPacketListener.CloseSocket(
+                    new CSteamID(callback.m_ulSteamIDUserChanged));
+            }
+        }
+
+        private void OnP2PSessionRequest(P2PSessionRequest_t callback)
+        {
+            SteamNetworking.AcceptP2PSessionWithUser(callback.m_steamIDRemote);
+            AcceptUser(callback.m_steamIDRemote);
+        }
+
+        private void AcceptUser(CSteamID user)
+        {
+            if (user == SteamUser.GetSteamID() ||
+                steamPacketListener.HasConnectedSocket(user))
+            {
+                return;
+            }
+
+            var socket = new SteamSocket(user, true);
+            socket.RegisterSteamPacketListener(steamPacketListener);
+            joiningUsers.Enqueue(socket);
         }
 
         public ISocketStream AcceptClient()
         {
             Plugin.Log("Waiting to accept a client...");
             SteamSocket socket;
-            while (!joiningUsers.WaitAndTryDequeue(out socket)) { }
+            while (!joiningUsers.WaitAndTryDequeue(out socket, stopSource.Token)) { }
             Plugin.Log("New client accepted!");
             return socket;
         }
@@ -89,6 +115,8 @@ namespace BeaverBuddies.Steam
         public void Stop()
         {
             Plugin.Log("Stopping SteamListener...");
+            stopSource.Cancel();
+            steamPacketListener?.CloseAllSockets();
             SteamMatchmaking.LeaveLobby(LobbyID);
             foreach (IDisposable callback in callbacks)
             {

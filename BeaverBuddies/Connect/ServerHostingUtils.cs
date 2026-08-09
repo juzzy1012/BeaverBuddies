@@ -103,12 +103,16 @@ namespace BeaverBuddies.Connect
             });
         }
 
-        private static IEnumerator UpdateDialogBox(DialogBox box, ServerEventIO io, ILoc loc)
+        private static IEnumerator UpdateDialogBox(DialogBox box, ServerEventIO io, ILoc loc,
+            Action startWhenReady, int minimumReadyClients)
         {
             var label = box._root.Q<Label>("Message");
             string baseMessage = loc.T("BeaverBuddies.Host.ConnectedClients");
             while (true)
             {
+                // ReplayService does not exist while the host is in this lobby,
+                // so the lobby must process readiness acknowledgements itself.
+                io.Update();
                 List<string> clients = io.NetBase.GetConnectedClients();
                 string content = baseMessage;
                 int nonLocalID = 1;
@@ -118,6 +122,14 @@ namespace BeaverBuddies.Connect
                     content += $"\n* {name}";
                 }
                 label.text = content;
+
+                if (minimumReadyClients > 0 && io.AreAllClientsReady)
+                {
+                    Plugin.Log($"All {minimumReadyClients} clients loaded the checkpoint; " +
+                        "resuming the host automatically");
+                    startWhenReady();
+                    yield break;
+                }
                 yield return 0;
             }
         }
@@ -150,10 +162,20 @@ namespace BeaverBuddies.Connect
 
             ServerEventIO io = new ServerEventIO();
             EventIO.Set(io);
-            io.Start(data, minimumReadyClients);
+            if (!io.Start(data, minimumReadyClients))
+            {
+                EventIO.Reset();
+                shower.Create()
+                    .SetMessage("Could not start the multiplayer server. " +
+                        "Check that the configured port is available, then try again.")
+                    .SetDefaultCancelButton()
+                    .Show();
+                return;
+            }
 
             var behavior = GetMonoBehaviour(sceneLoader._sceneLoader);
             Coroutine coroutine = null;
+            bool isStarting = false;
 
             var socketListener = io.SocketListener;
             SteamListener steamListener = socketListener as SteamListener;
@@ -164,21 +186,34 @@ namespace BeaverBuddies.Connect
             Plugin.Log($"Steam listener: {steamListener}");
 
             var loc = shower._loc;
+            Action<bool> startGame = allowMissingClients =>
+            {
+                if (isStarting)
+                {
+                    return;
+                }
+                isStarting = true;
+
+                if (allowMissingClients && minimumReadyClients > 0)
+                {
+                    // The normal button remains a deliberate escape hatch if a
+                    // previous participant has left during the coordinated reload.
+                    io.AllowStartingWithConnectedClients();
+                }
+                if (coroutine != null)
+                {
+                    behavior.StopCoroutine(coroutine);
+                }
+
+                // Make sure to set the RNG seed before loading the map.
+                // The client does the same.
+                DeterminismService.InitGameStartState(data);
+                sceneLoader.StartSaveGame(saveReference);
+            };
+
             var boxCreator = shower.Create()
                 .SetMessage("")
-                .SetConfirmButton(() =>
-                {
-                    if (coroutine != null)
-                    {
-                        behavior.StopCoroutine(coroutine);
-                    }
-
-                    // Make sure to set the RNG seed before loading the map
-                    // The client will do the same
-                    DeterminismService.InitGameStartState(data);
-
-                    sceneLoader.StartSaveGame(saveReference);
-                }, loc.T("BeaverBuddies.Host.StartGame"))
+                .SetConfirmButton(() => startGame(true), loc.T("BeaverBuddies.Host.StartGame"))
                 .SetCancelButton(() =>
                 {
                     if (coroutine != null)
@@ -197,7 +232,8 @@ namespace BeaverBuddies.Connect
             boxCreator.SetDefaultCancelButton(loc.T(CommonLocKeys.CancelKey));
 
             DialogBox box = boxCreator.Show();
-            coroutine = behavior.StartCoroutine(UpdateDialogBox(box, io, shower._loc));
+            coroutine = behavior.StartCoroutine(UpdateDialogBox(
+                box, io, shower._loc, () => startGame(false), minimumReadyClients));
 
         }
     }

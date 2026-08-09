@@ -1,5 +1,9 @@
 v1.7.3
 * A client joining a running session now triggers an on-demand checkpoint reload. Existing players reconnect automatically and everyone loads the same checkpoint before play resumes, without periodic state snapshots or unbounded event history.
+* Hardened connection recovery: dropped TCP or Steam sessions reconnect automatically with fast time-based backoff, and delayed callbacks from old attempts are ignored.
+* Concurrent joins now receive one canonical initialization sequence, while framed writes are atomic so map and gameplay data cannot interleave.
+* Steam reconnects no longer depend on rejoining the host's lobby, partial packets are preserved, and departed peers are removed from the loading barrier.
+* Added bounded protocol frames and decompression, fail-closed event delivery, faster TCP map transfer, transport fallback, and integration coverage for join/rejoin races.
 
 v1.7.2
 * Fixed false desyncs after returning to the main menu by correctly clearing save-in-progress state.
